@@ -181,6 +181,115 @@ module ventaglio
   //////////////////////////////////
   //   Index Buffer (FIFO)        //
   //////////////////////////////////
+
+
+  /******************************/
+  /*       Index Job List       */
+  /******************************/
+
+  // Struct for data that gets logged into the job list spill buffer
+  typedef struct packed {
+    spatz_id_t      id;
+    vreg_t          idx_vreg;
+    logic           unstructured;
+    vlen_t          vl;
+  } idx_job_t;
+
+  idx_job_t idx_job_in, idx_job_out;
+  logic idx_job_valid, idx_job_ready;
+
+  logic is_unstructured;
+  assign is_unstructured = '0;
+
+  logic load_index_o;
+  // assign load_index_o = '0;
+
+  assign idx_job_in = '{
+    id: spatz_req_i.id,
+    idx_vreg: spatz_req_i.op_vtl.idx_vreg,
+    unstructured: is_unstructured,
+    vl: spatz_req_i.vl
+  };
+
+  logic new_op;
+  assign new_op = spatz_req_valid_i
+                    && spatz_req_i.op_vtl.use_vtl
+                    && !spatz_req_i.op_vtl.clear_buffer
+                    && vtl_req_ready_o;
+
+  // 3. One spill register carries the whole bundle
+  spill_register 
+  #(
+    .T(idx_job_t) 
+  ) i_idx_job_list (
+    .clk_i  (clk_i        ),
+    .rst_ni (rst_ni       ),
+    .data_i (idx_job_in   ),
+    .valid_i(new_op       ),
+    .ready_o(/* unused */ ),
+    .data_o (idx_job_out  ),
+    .valid_o(idx_job_valid),
+    .ready_i(idx_job_ready)   // the request generator drives this when it is done with a job
+  );
+
+  /******************************/
+  /*      Request Generator     */
+  /******************************/
+
+  localparam int unsigned IdxBufDepth = 2;
+  localparam int unsigned IdxPerWord = 16;
+
+  logic idx_req_valid;      // indication of a valid index request to the idx_req register 
+  logic idx_req_accepted;   // request handed to the request register this cycle
+  logic idx_buf_pop;        // 1 word left the index buffer this cycle - popped
+  logic idx_credit_left;    // Returns 1 if there is still a free slot
+  logic idx_req_reg_ready;
+
+  logic last_word;
+
+  logic [$clog2(8):0] word_cnt_d, word_cnt_q;
+  logic [$clog2(8):0] num_words;
+
+  assign num_words            = idx_job_out.unstructured ? (idx_job_out.vl + IdxPerWord - 1) / IdxPerWord : 1;   // round up vl/16 to CEIL
+  assign last_word            = (word_cnt_q == num_words - 1);
+
+  assign idx_buf_pop          = (is_unstructured) ? load_index_o : (spatz_req_valid && spatz_req_ready && !spatz_req.op_vtl.clear_buffer);
+  assign idx_req_valid        = idx_job_valid && idx_credit_left;
+  // assign idx_req_reg_ready    = /*ready_o of the idx_req register*/;
+  assign idx_req_accepted     = idx_req_valid & idx_req_reg_ready;
+
+  credit_counter #(
+  .NumCredits     (IdxBufDepth)
+  ) i_idx_credit (
+    .clk_i          (clk_i           ),
+    .rst_ni         (rst_ni          ),
+    .credit_o       (/* unused */    ),
+    .credit_give_i  (idx_buf_pop     ),
+    .credit_take_i  (idx_req_accepted),
+    .credit_init_i  (1'b0            ),
+    .credit_left_o  (idx_credit_left ),
+    .credit_crit_o  (/* unused */    ),
+    .credit_full_o  (/* unused */    )
+  );
+
+  `FF(word_cnt_q, word_cnt_d, '0);
+
+  always_comb begin
+      word_cnt_d = word_cnt_q;
+      idx_job_ready = 1'b0;
+
+      if(idx_req_accepted) begin
+          if(last_word) begin
+              word_cnt_d = '0;
+              idx_job_ready = 1'b1;
+          end
+          else begin
+              word_cnt_d = word_cnt_q + 1;
+          end
+      end
+  end
+
+
   // Fetch trigger: monitors the pre-spill spatz_req channel, fired by a
   // successful admit handshake. Issuing the read one cycle later (through
   // i_idx_req_reg below) lets the controller scoreboard register the index
@@ -217,7 +326,7 @@ module ventaglio
     .ready_o(/*    UNUSED    */),
     .data_o (index_q           ),
     .valid_o(index_valid_q     ),
-    .ready_i(idx_spill_pop     )
+    .ready_i(idx_buf_pop     )
   );
 
   // Master VRF read-request buffer. Carries {id, addr} so vrf_re_o /
@@ -232,7 +341,11 @@ module ventaglio
   } idx_req_t;
 
   idx_req_t idx_req_in, idx_req_out;
-  assign idx_req_in  = '{ id: eff_id, addr: {eff_vidx, $clog2(NrWordsPerVector)'(1'b0)}};
+  // assign idx_req_in  = '{ id: eff_id, addr: {eff_vidx, $clog2(NrWordsPerVector)'(1'b0)}};
+  assign idx_req_in = '{
+    id:   idx_job_out.id,
+    addr: {idx_job_out.idx_vreg, $clog2(NrWordsPerVector)'(1'b0)} + word_cnt_q
+  };
   assign vrf_id_o[0] = idx_req_out.id;
   assign vrf_raddr_o = idx_req_out.addr;
 
@@ -242,8 +355,8 @@ module ventaglio
     .clk_i  (clk_i             ),
     .rst_ni (rst_ni            ),
     .data_i (idx_req_in        ),
-    .valid_i(eff_fetch         ),
-    .ready_o(/*    UNUSED    */),
+    .valid_i(idx_req_valid     ),
+    .ready_o(idx_req_reg_ready ),
     .data_o (idx_req_out       ),
     .valid_o(vrf_re_o          ),
     .ready_i(vrf_rvalid_i      )
@@ -539,7 +652,7 @@ module ventaglio
     // index cfg
     .index_i     (index_q              ),
     .vtl_cfg_i   (spatz_req.op_vtl.sp_cfg),
-    .load_index_o(/* unused: per-beat index-refresh hook, no consumer */)
+    .load_index_o(load_index_o)
   );
 
   /******************************/
