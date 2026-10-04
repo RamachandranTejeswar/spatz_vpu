@@ -46,6 +46,7 @@ sources:
             - hw/ip/ventaglio/ventaglio_scatter_datapath.sv
             - hw/ip/ventaglio/ventaglio_scatter.sv
             - hw/ip/ventaglio/ventaglio_gather.sv
+            - hw/ip/ventaglio/ventaglio_unstructured_gather_datapath.sv
     # Level 3
     - hw/src/spatz_fpu_sequencer.sv
     - hw/src/spatz_ipu.sv
