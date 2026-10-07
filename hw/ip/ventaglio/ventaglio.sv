@@ -6,7 +6,7 @@
 //
 // Ventaglio — streamlined sparse gather/scatter execution unit.
 //
-//   Bank       : VTGNrChannels channels x N_FU banks (ELEN each), channel-
+//   Bank       : VTGNrBankChannels channels x N_FU banks (ELEN each), channel-
 //                interleaved (f_channel/f_row). Holds the sparsity-expanded
 //                accumulator vreg(s).
 //   Op queue   : i_operation_queue spill latches each use_vtl op
@@ -92,7 +92,7 @@ module ventaglio
     .rst_ni (rst_ni                                             ),
     .data_i (spatz_req_i                                        ),
     .valid_i(spatz_req_valid_i && spatz_req_i.op_vtl.use_vtl    ),
-    .ready_o(vtl_req_ready_o                                     ),
+    .ready_o(vtl_req_ready_o                                    ),
     .data_o (spatz_req                                          ),
     .valid_o(spatz_req_valid                                    ),
     .ready_i(spatz_req_ready                                    )
@@ -200,21 +200,29 @@ module ventaglio
   logic load_index_o;
   // assign load_index_o = '0;
 
+  logic is_unstructured;
+  assign is_unstructured = spatz_req_i.op_vtl.gather_vs2 | spatz_req_i.op_vtl.uscatter_vd;
+
+  /* 
+    Forming the input job data packet with
+    - id          -> Operation id
+    - idx_vreg    -> The index of the vector register from where the index words are to be loaded
+    - gather_vs2  -> Indicates whether this is a structured/unstructured gather operation
+    - vl          -> Indicates the number of elements to be processed by the vector register in this turn, among the total number of elements available
+  */
   assign idx_job_in = '{
     id: spatz_req_i.id,
     idx_vreg: spatz_req_i.op_vtl.idx_vreg,
-    unstructured: (spatz_req_i.op_vtl.gather_vs2),
+    unstructured: (is_unstructured),
     vl: spatz_req_i.vl
   };
 
+  // new_op -> if spatz_req is valid, (and) if the opration uses VTL (and) if the opertion is not to clear the buffer (and) if Ventaglio is ready, then accept the new operation
   logic new_op;
-  assign new_op = spatz_req_valid_i
-                    && spatz_req_i.op_vtl.use_vtl
-                    && !spatz_req_i.op_vtl.clear_buffer
-                    && vtl_req_ready_o;
-
+  assign new_op = spatz_req_valid_i && spatz_req_i.op_vtl.use_vtl && !spatz_req_i.op_vtl.clear_buffer && vtl_req_ready_o;
+  
   // List of jobs
-  spill_register 
+  spill_register
   #(
     .T(idx_job_t) 
   ) i_idx_job_list (
@@ -222,34 +230,73 @@ module ventaglio
     .rst_ni (rst_ni       ),
     .data_i (idx_job_in   ),
     .valid_i(new_op       ),
-    .ready_o(/* unused */ ),
+    .ready_o(/* unused */ ),  // ready_o can be left unused because a new_op is committed only when ventaglio is ready and there is a free slot in the spill register.
+                              // This handshake is already handled by the op_queue.
     .data_o (idx_job_out  ),
     .valid_o(idx_job_valid),
-    .ready_i(idx_job_ready)   // the request generator drives this when it is done with a job
+    .ready_i(idx_job_ready)   // the request generator drives this when it is done with a job and is ready to accept the next job from the list of jobs (Job = Operation)
   );
+
+  /******************************/
+  /*      Scatter Job List      */
+  /******************************/
+
+  vlen_t usp_sjob_vl;         // vl of the scatter job being written
+  logic  usp_sjob_valid;      // a scatter job is pending / in progress
+  logic  usp_sjob_done;       // the scatter datapath finished the job (last beat written)
+  
+  spill_register #(
+    .T(vlen_t)
+  ) i_usp_scatter_jobs (
+    .clk_i  (clk_i                                            ),
+    .rst_ni (rst_ni                                           ),
+    .data_i (spatz_req_i.vl                                   ),
+    .valid_i(new_op && spatz_req_i.op_vtl.uscatter_vd         ),   // a vsxu enters Ventaglio
+    .ready_o(/* unused: at most 2 vsxu in flight */           ),
+    .data_o (usp_sjob_vl                                      ),
+    .valid_o(usp_sjob_valid                                   ),
+    .ready_i(usp_sjob_done                                    )    // drop it once fully written
+  );
+
+  logic usp_scatter_running_q, usp_scatter_running_d;
+  `FF(usp_scatter_running_q, usp_scatter_running_d, 1'b0)
+
+   always_comb begin
+      usp_scatter_running_d = usp_scatter_running_q;
+      if (usp_sjob_done)                                                   usp_scatter_running_d = 1'b0;
+      else if (spatz_req_valid && spatz_req.op_vtl.uscatter_vd && usp_sjob_valid) usp_scatter_running_d = 1'b1;
+    end
+      
+    logic usp_scatter_running; 
+    assign usp_scatter_running = usp_scatter_running_q || (spatz_req_valid && spatz_req.op_vtl.uscatter_vd && usp_sjob_valid);
+
 
   /******************************/
   /*      Request Generator     */
   /******************************/
 
-  localparam int unsigned IdxBufDepth = 2;
-  localparam int unsigned IdxPerWord = 16;
+  localparam int unsigned IdxBufDepth = 2;  // Depth of the spill register
+  localparam int unsigned IdxPerWord = 32;  // Indices per index word (16 indices in a 256-bit index word)
 
-  logic idx_req_valid;      // indication of a valid index request to the idx_req register 
-  logic idx_req_accepted;   // request handed to the request register this cycle
+  logic idx_req_valid;      // Indication of a valid index request to the idx_req register 
+  logic idx_req_accepted;   // Request handed to the request register this cycle
   logic idx_buf_pop;        // 1 word left the index buffer this cycle - popped
-  logic idx_credit_left;    // Returns 1 if there is still a free slot
-  logic idx_req_reg_ready;
+  logic idx_credit_left;    // Returns 1 if there is still a free slot in the index buffer
+  logic idx_req_reg_ready;  // The ready signal returned from the idx_req register for a successful request-accept handshake
 
-  logic last_word;
+  logic last_word;          // Checks whether this is the last index word for that one instruction
 
-  logic [$clog2(8):0] word_cnt_d, word_cnt_q;
-  logic [$clog2(8):0] num_words;
+  localparam int unsigned NumIdxWords = VLEN * 4 / VRFWordWidth;
+  logic [$clog2(NumIdxWords):0] word_cnt_d, word_cnt_q;
+  logic [$clog2(NumIdxWords):0] num_words;
 
   assign num_words            = idx_job_out.unstructured ? (idx_job_out.vl + IdxPerWord - 1) / IdxPerWord : 1;   // round up vl/16 to CEIL
-  assign last_word            = (word_cnt_q == num_words - 1);
+  assign last_word            = (word_cnt_q == num_words - 1);    // Chekc the word_cnt_q to see if this is the last index word
 
-  assign idx_buf_pop          = spatz_req.op_vtl.gather_vs2 ? load_index_o : (spatz_req_valid && spatz_req_ready && !spatz_req.op_vtl.clear_buffer);
+  // assign idx_buf_pop          = (spatz_req.op_vtl.gather_vs2 | spatz_req.op_vtl.uscatter_vd) ? load_index_o : (spatz_req_valid && spatz_req_ready && !spatz_req.op_vtl.clear_buffer);
+
+  assign idx_buf_pop = (spatz_req.op_vtl.gather_vs2 | spatz_req.op_vtl.uscatter_vd | usp_sjob_valid) ? load_index_o : (spatz_req_valid && spatz_req_ready && !spatz_req.op_vtl.clear_buffer);
+
   assign idx_req_valid        = idx_job_valid && idx_credit_left;
   // assign idx_req_reg_ready    = /*ready_o of the idx_req register*/;
   assign idx_req_accepted     = idx_req_valid & idx_req_reg_ready;
@@ -275,10 +322,12 @@ module ventaglio
       idx_job_ready = 1'b0;
 
       if(idx_req_accepted) begin
+          // If this is the last word of the operation - reset word counter and send a job_ready request to Job List, asking for the next Job/Operation
           if(last_word) begin
               word_cnt_d = '0;
               idx_job_ready = 1'b1;
           end
+          // Else, increment the word counter until it reaches num_words - 1, i.e., the last word of that operation
           else begin
               word_cnt_d = word_cnt_q + 1;
           end
@@ -322,7 +371,7 @@ module ventaglio
     .ready_o(/*    UNUSED    */),
     .data_o (index_q           ),
     .valid_o(index_valid_q     ),
-    .ready_i(idx_buf_pop     )
+    .ready_i(idx_buf_pop       )
   );
 
   // Master VRF read-request buffer. Carries {id, addr} so vrf_re_o /
@@ -363,7 +412,7 @@ module ventaglio
   ////////////////////////////////
 
   // signals for gather or scatter
-  logic is_gather, is_scatter, is_usp_gather;
+  logic is_gather, is_scatter, is_usp_gather, is_usp_scatter;
 
   // Beats per op = vl / elements_per_beat, where elements_per_beat =
   // VRFWordBWidth >> vsew (VRFWordBWidth = N_FU * ELENB). Derivation in
@@ -390,13 +439,13 @@ module ventaglio
 
 
   // `f_channel` function extract the channel index
-  function automatic logic [$clog2(VTGNrChannels)-1:0] f_channel(vrf_addr_t addr);
-    f_channel = addr[$clog2(VTGNrChannels)-1:0];
+  function automatic logic [$clog2(VTGNrBankChannels)-1:0] f_channel(vrf_addr_t addr);
+    f_channel = addr[$clog2(VTGNrBankChannels)-1:0];
   endfunction: f_channel
 
   // `f_row` function extract the word (row) index within one channel
   function automatic logic [$clog2(VTGNrWordsPerChannel)-1:0] f_row(vrf_addr_t addr);
-    f_row = addr[$clog2(VTGNrWordsPerChannel * VTGNrChannels)-1:$clog2(VTGNrChannels)];
+    f_row = addr[$clog2(VTGNrWordsPerChannel * VTGNrBankChannels)-1:$clog2(VTGNrBankChannels)];
   endfunction: f_row
 
   // (vtg_row_addr_t typedef defined earlier alongside the clear sequencer)
@@ -420,21 +469,23 @@ module ventaglio
     is_gather  = spatz_req.op_vtl.gather_vd  && rgather_en_i;
     is_usp_gather = spatz_req.op_vtl.gather_vs2 && rgather_en_i;
     is_scatter = spatz_req.op_vtl.scatter_vd && wscatter_en_i;
+	// is_usp_scatter = spatz_req.op_vtl.uscatter_vd && wscatter_en_i;   // vsxu.vv write from the VFU
+  is_usp_scatter = usp_sjob_valid && wscatter_en_i;
   end
 
   // write signals
-  vtg_row_addr_t          [VTGNrChannels-1:0] waddr;
-  ventaglio_narrow_data_t [VTGNrChannels-1:0] wdata;
-  logic                   [VTGNrChannels-1:0] we;
-  ventaglio_narrow_be_t   [VTGNrChannels-1:0] wbe;
+  vtg_row_addr_t          [VTGNrBankChannels-1:0] waddr;
+  ventaglio_narrow_data_t [VTGNrBankChannels-1:0] wdata;
+  logic                   [VTGNrBankChannels-1:0] we;
+  ventaglio_narrow_be_t   [VTGNrBankChannels-1:0] wbe;
 
   // read signals
-  vtg_row_addr_t          [VTGNrChannels-1:0] raddr;
-  ventaglio_narrow_data_t [VTGNrChannels-1:0] rdata;
+  vtg_row_addr_t          [VTGNrBankChannels-1:0] raddr;
+  ventaglio_narrow_data_t [VTGNrBankChannels-1:0] rdata;
 
   // write mapping
-  logic [VTGNrChannels-1:0]                    write_request;
-  logic [VTGNrChannels-1:0][VTGNrChannels-1:0] scatter_write_request;
+  logic [VTGNrBankChannels-1:0]                    write_request;
+  logic [VTGNrBankChannels-1:0][VTGNrChannels-1:0] scatter_write_request;
 
   // post scatter signals
   logic      [VTGNrChannels-1:0] scatter_we;
@@ -446,12 +497,24 @@ module ventaglio
 
   logic                          post_scatter_wvalid;
 
+  // Unstructured Sparsity Scatter Signals
+  vtg_row_addr_t  [VTGNrBankChannels-1:0][VTGNrBanksPerChannel-1:0] usp_waddr;
+  vtg_bank_data_t [VTGNrBankChannels-1:0][VTGNrBanksPerChannel-1:0] usp_wdata;
+  logic           [VTGNrBankChannels-1:0][VTGNrBanksPerChannel-1:0] usp_we;     // For banks to be written to in the current cycle
+  logic usp_scatter_active;
+  // assign usp_scatter_active = spatz_req_valid && spatz_req.op_vtl.uscatter_vd;
+   assign usp_scatter_active = usp_sjob_valid;
+
+  logic usp_scatter_wready;
+  logic usp_scatter_load_index;
+
+
   always_comb begin: gen_write_request
-    for (int channel = 0; channel < VTGNrChannels; channel++) begin
-      write_request[channel] = we_i && f_channel(waddr_i) == channel && !is_scatter;
+    for (int channel = 0; channel < VTGNrBankChannels; channel++) begin
+      write_request[channel] = we_i && f_channel(waddr_i) == channel && !is_scatter && !is_usp_scatter;
     end
     // scatter requests
-    for (int b_channel = 0; b_channel < VTGNrChannels; b_channel++) begin   // channels from the bank side
+    for (int b_channel = 0; b_channel < VTGNrBankChannels; b_channel++) begin   // channels from the bank side
       for (int s_channel = 0; s_channel < VTGNrChannels; s_channel++) begin // channels from the scatter datapath side
         scatter_write_request[b_channel][s_channel] = scatter_we[s_channel] && f_channel(scatter_waddr[s_channel]) == b_channel && is_scatter;
       end
@@ -467,15 +530,17 @@ module ventaglio
     scatter_wvalid = '0;
 
     if (clear_active_q) begin // priority 0: vventclr — zero every cell
-      for (int unsigned channel = 0; channel < VTGNrChannels; channel++) begin
+      for (int unsigned channel = 0; channel < VTGNrBankChannels; channel++) begin
         waddr[channel] = clear_row_q;
         wdata[channel] = '0;
         we[channel]    = 1'b1;
         wbe[channel]   = '1;
       end
       // wvalid_o stays 0: no slave-port write is being acknowledged.
+    end else if (is_usp_scatter) begin
+      wvalid_o = usp_scatter_wready;
     end else if (!is_scatter) begin // priority 1: normal requests
-      for (int unsigned channel = 0; channel < VTGNrChannels; channel++) begin
+      for (int unsigned channel = 0; channel < VTGNrBankChannels; channel++) begin
         if (write_request[channel]) begin
           waddr[channel] = f_row(waddr_i);
           wdata[channel] = wdata_i;
@@ -485,7 +550,7 @@ module ventaglio
         end
       end
     end else begin // priority 2: scatter requests
-      for (int unsigned b_channel = 0; b_channel < VTGNrChannels; b_channel++) begin
+      for (int unsigned b_channel = 0; b_channel < VTGNrBankChannels; b_channel++) begin
         for (int unsigned s_channel = 0; s_channel < VTGNrChannels; s_channel++) begin
           if (scatter_write_request[b_channel][s_channel]) begin
             waddr[b_channel]           = f_row(scatter_waddr[s_channel]);
@@ -505,9 +570,9 @@ module ventaglio
 
   // read_request: non-gather request signals
   // gathered_read_request: gather request signals
-  logic [VTGNrChannels-1:0]                    read_request;
+  logic [VTGNrBankChannels-1:0]                    read_request;
 
-  logic      [VTGNrChannels-1:0][VTGNrChannels-1:0] gather_read_request;
+  logic      [VTGNrBankChannels-1:0][VTGNrChannels-1:0] gather_read_request;
   logic      [VTGNrChannels-1:0]                    gather_re;
   vrf_addr_t [VTGNrChannels-1:0]                    gather_raddr;
 
@@ -524,11 +589,11 @@ module ventaglio
 
   always_comb begin: gen_read_request
     // normal requests
-    for (int channel = 0; channel < VTGNrChannels; channel++) begin
+    for (int channel = 0; channel < VTGNrBankChannels; channel++) begin
       read_request[channel] = re_i && f_channel(raddr_i) == channel && !(is_gather) && !(is_usp_gather);
     end
     // gathered requests
-    for (int b_channel = 0; b_channel < VTGNrChannels; b_channel++) begin   // channels from the bank side
+    for (int b_channel = 0; b_channel < VTGNrBankChannels; b_channel++) begin   // channels from the bank side
       for (int g_channel = 0; g_channel < VTGNrChannels; g_channel++) begin // channels from the gather datapath side
         gather_read_request[b_channel][g_channel] = gather_re[g_channel] && f_channel(gather_raddr[g_channel]) == b_channel && is_gather;
       end
@@ -545,10 +610,12 @@ module ventaglio
     gather_rdata  = 'x;
   
     if(is_usp_gather) begin
+      // Here, the data from the right banks have already been picked and consolidated together.
+      // The data and valid signals can be dirctly dispatched as outputs
       rdata_o  = usp_gather_data;
       rvalid_o = usp_gather_valid;
     end else if (!is_gather) begin // priority 1: normal read requests
-      for (int unsigned b_channel = 0; b_channel < VTGNrChannels; b_channel++) begin // channels from the bank side
+      for (int unsigned b_channel = 0; b_channel < VTGNrBankChannels; b_channel++) begin // channels from the bank side
         if (read_request[b_channel]) begin
           raddr[b_channel] = f_row(raddr_i);
           rdata_o          = rdata[b_channel];
@@ -556,7 +623,7 @@ module ventaglio
         end
       end
     end else if (is_gather) begin // priority 2: gather accesses
-      for (int unsigned b_channel = 0; b_channel < VTGNrChannels; b_channel++) begin // channels from the bank side
+      for (int unsigned b_channel = 0; b_channel < VTGNrBankChannels; b_channel++) begin // channels from the bank side
         for (int unsigned g_channel = 0; g_channel < VTGNrChannels; g_channel++) begin // channels from the gather datapath side
           if (gather_read_request[b_channel][g_channel]) begin
             raddr[b_channel]          = f_row(gather_raddr[g_channel]);
@@ -571,6 +638,8 @@ module ventaglio
     end
   end
 
+  logic usp_gather_load_index;
+  assign load_index_o = usp_gather_load_index | usp_scatter_load_index;
 
   /******************************/
   /*      Scatter DataPath      */
@@ -604,27 +673,63 @@ module ventaglio
     .index_valid_i (index_valid_q) // meaning a new read data available
   );
 
+  /***********************************/
+  /*  Unstructured Scatter DataPath  */
+  /***********************************/
+
+  unstructured_scatter_datapath i_usp_scatter 
+  (
+    .clk_i         (clk_i                    ),
+    .rst_ni        (rst_ni                   ),
+    .enable_i      (usp_sjob_valid        ),
+    .index_i       (index_q                  ),
+    .index_valid_i (index_valid_q            ),
+    .vl_i          (usp_sjob_vl              ),
+    .wdata_i       (wdata_i                  ),
+    .wvalid_i      (we_i && is_usp_scatter   ),   // the VFU is delivering a vsxu beat
+    .wready_o      (usp_scatter_wready       ),
+    .load_index_o  (usp_scatter_load_index   ),
+    .bank_row_o    (usp_waddr                ),
+    .bank_wdata_o  (usp_wdata                ),
+    .bank_we_o     (usp_we                   ),
+    .job_done_o    (usp_sjob_done            )
+  );
+
+
 
   /******************************/
   /*           Buffer           */
   /******************************/
 
-  // Buffer has `VTGNrChannels` channels
+  // Buffer has `VTGNrBankChannels` channels
   // Each channel is divided into `N_FU*2` (8) banks, whose width is `ELEN/2` (32-bits)
   // In this way, each channel can provide the same bandwidth as the VLSU and VPU
 
   // Unstructured Sparsity Reading Logic
 
-  vtg_row_addr_t [VTGNrChannels-1:0][VTGNrBanksPerChannel-1:0] usp_raddr;
+  vtg_row_addr_t [VTGNrBankChannels-1:0][VTGNrBanksPerChannel-1:0] usp_raddr;
   logic usp_active; // Are we doing an unstructured gather?
 
   assign usp_active = spatz_req_valid && spatz_req.op_vtl.gather_vs2;
+
   
-	for (genvar channel = 0; channel < VTGNrChannels; channel++) begin : gen_vtg_channels
+  
+	for (genvar channel = 0; channel < VTGNrBankChannels; channel++) begin : gen_vtg_channels
   	for (genvar bank = 0; bank < VTGNrBanksPerChannel; bank++) begin: gen_vtg_banks
       
       vtg_row_addr_t vtg_raddr;   // one per bank
       assign vtg_raddr = usp_active ? usp_raddr[channel][bank] : raddr[channel];
+
+      vtg_row_addr_t vtg_waddr;
+      assign vtg_waddr = usp_scatter_active ? usp_waddr[channel][bank] : waddr[channel];
+
+      vtg_bank_data_t vtg_wdata;
+      assign vtg_wdata = usp_scatter_active ? usp_wdata[channel][bank] : wdata[channel][VTGBankWidth*bank +: VTGBankWidth];
+
+      logic vtg_we;
+      logic [VTGBankBWidth-1:0] vtg_wbe;
+      assign vtg_we = usp_scatter_active ? usp_we[channel][bank] : we[channel];
+      assign vtg_wbe = usp_scatter_active ? {VTGBankBWidth{usp_we[channel][bank]}} : wbe[channel][VTGBankBWidth*bank +: VTGBankBWidth];
       
     	ventaglio_regfile #(
       	.NrWords    (VTGNrWordsPerChannel ),
@@ -633,30 +738,33 @@ module ventaglio
           .clk_i     (clk_i                                              ),
           .rst_ni    (rst_ni                                             ),
           .testmode_i(testmode_i                                         ),
-          .waddr_i   (waddr[channel]                                     ),
-          .wdata_i   (wdata[channel][VTGBankWidth*bank  +: VTGBankWidth ]),
-          .we_i      (we[channel]                                        ),
-          .wbe_i     (wbe[channel][VTGBankBWidth*bank +: VTGBankBWidth]  ),
+          .waddr_i   (vtg_waddr                                          ),
+          .wdata_i   (vtg_wdata                                          ),
+          .we_i      (vtg_we                                             ),
+          .wbe_i     (vtg_wbe                                            ),
           .raddr_i   (vtg_raddr                                          ),
           .rdata_o   (rdata[channel][VTGBankWidth*bank  +: VTGBankWidth ])
         );
 		end
 	end
 
-  /***********************************/
-  /*  Unstructured Gather  DataPath  */
-  /***********************************/
+  /************************************/
+  /*   Unstructured Gather DataPath   */
+  /************************************/
+
 
   unstructured_gather_datapath i_usp_gather (
     .clk_i(clk_i),
     .rst_ni(rst_ni),
-    .enable_i(usp_active),
+    .enable_i(usp_active && !usp_scatter_running),
     .index_i(index_q),
     .index_valid_i(index_valid_q),
     .vl_i(spatz_req.vl),
     .gather_ready_i (re_i && is_usp_gather),
     .bank_rdata_i(rdata),
-    .load_index_o(load_index_o),
+     .raddr_i (raddr_i                            ),
+      .op_pop_i(spatz_req_valid && spatz_req_ready ),
+    .load_index_o(usp_gather_load_index),
     .bank_row_o(usp_raddr),
     .gather_data_o(usp_gather_data),
     .gather_valid_o(usp_gather_valid)

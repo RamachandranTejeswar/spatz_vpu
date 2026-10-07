@@ -243,6 +243,7 @@ package spatz_pkg;
 
     logic gather_vd;     // vfx ops with vd_is_src: pre-gather old vd
 	logic gather_vs2;	 // vfx ops with vs2 activation gather for unstructured sparsity
+	logic uscatter_vd;	// vfx ops with vd accumulator scatter for unstructured sparsity
     logic scatter_vd;    // vfx ops: scatter result back through index
     logic clear_buffer;  // vventclr: zero the entire ventaglio bank
 
@@ -496,6 +497,7 @@ package spatz_pkg;
   // VTGNrChannels represents the max asymmetric bandwidth ratio (1:4 -> 4,
   // 1:2 -> 2). Default 4 (= 1:4 support).
   localparam int unsigned VTGNrChannels         = VENTAGLIO_WFACTOR;
+  localparam int unsigned VTGNrBankChannels     = 16;   					// physical channels of 8 banks each (8 x 8 = 64 banks)
   localparam int unsigned VTGNrBanksPerChannel  = N_FU * 2;
   // localparam int unsigned VTGChannelWidth       = VTGNrBanksPerChannel * ELEN;
   // localparam int unsigned VTGChannelBWidth      = VTGNrBanksPerChannel * ELENB;
@@ -503,9 +505,10 @@ package spatz_pkg;
 	localparam int unsigned VTGBankWidth          = ELEN / 2;          											// 32 bits per bank
 	localparam int unsigned VTGChannelWidth       = VTGNrBanksPerChannel * VTGBankWidth;   	// still 256
 	localparam int unsigned VTGChannelBWidth      = VTGNrBanksPerChannel * VTGBankBWidth;  	// still 32
-	localparam int unsigned VTGNrWordsPerChannel  = VENTAGLIO_BUFFER_SIZE / (VTGNrChannels * VTGChannelWidth);
+	// localparam int unsigned VTGNrWordsPerChannel  = VENTAGLIO_BUFFER_SIZE / (VTGNrChannels * VTGChannelWidth);
+	localparam int unsigned VTGNrWordsPerChannel  = VENTAGLIO_BUFFER_SIZE / (VTGNrBankChannels * VTGChannelWidth);   // 8192 / (8 x 256) = 4 rows
 
-	typedef logic [$clog2(VTGNrWordsPerChannel)-1:0] vtg_row_addr_t;    // row inside a bank (3 bits)
+	typedef logic [$clog2(VTGNrWordsPerChannel)-1:0] vtg_row_addr_t;    // row address inside a bank
   typedef logic [VTGBankWidth-1:0]                 vtg_bank_data_t;   // one bank word (32 bits)
 
 

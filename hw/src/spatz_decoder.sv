@@ -1421,7 +1421,63 @@ module spatz_decoder
           // disable masking
           spatz_req.op_arith.vm = 1'b1;
         end
+	
+	// Custom Gather Operation for Accumulators from Ventaglio Memory
+	riscv_instr::VLXU_VV: begin
+	  automatic vreg_t vd_field  = decoder_req_i.instr[11:7];    // destination (v0)
+	  automatic vreg_t vs1_field = decoder_req_i.instr[19:15];   // column indices (v12)
+	  automatic vreg_t vs2_field = decoder_req_i.instr[24:20];   // accumulators in Ventaglio (v24)
+	 
+	  spatz_req.op          = VFMUL;
+	  spatz_req.ex_unit     = VFU;
+	    
+	  spatz_req.vd          = vd_field;
+	  spatz_req.use_vd      = 1'b1;
+	  
+	  spatz_req.vs2         = vs2_field;    // read through Ventaglio's gather
+	  spatz_req.use_vs2     = 1'b1;
 
+	  spatz_req.rs1         = 32'h3F80_0000;           // the "0" in "OR 0"; use_vs1 stays 0
+	  spatz_req.use_vs1     = 1'b0;
+
+    spatz_req.rm = fpu_rnd_mode_i;
+    spatz_req.fm = fpu_fmt_mode_i;
+	  
+	  spatz_req.op_vtl.use_vtl    = 1'b1;
+	  spatz_req.op_vtl.gather_vs2 = 1'b1;   // same gather path as vfxumacc
+	  spatz_req.op_vtl.idx_vreg   = vs1_field;	// colummn indices used for gathereing accumulators from Ventaglio bank
+
+	  spatz_req.op_arith.vm = 1'b1;         // no masking
+	end
+
+	// Custom Scatter Operation for Accumulators back into the Ventaglio Memory
+	riscv_instr::VSXU_VV: begin
+	  automatic vreg_t vd_field  = decoder_req_i.instr[11:7];    // destination (v24)
+	  automatic vreg_t vs1_field = decoder_req_i.instr[19:15];   // column indices (v12)
+	  automatic vreg_t vs2_field = decoder_req_i.instr[24:20];   // accumulators in VRF (v0)
+	 
+	  spatz_req.op          = VFMUL;
+	  spatz_req.ex_unit     = VFU;
+	    
+	  spatz_req.vd          = vd_field;
+	  spatz_req.use_vd      = 1'b1;
+	  
+	  spatz_req.vs2         = vs2_field;    // read through Ventaglio's scatter indices
+	  spatz_req.use_vs2     = 1'b1;
+
+	  spatz_req.rs1         = 32'h3F80_0000;           // the "0" in "OR 0"; use_vs1 stays 0
+	  spatz_req.use_vs1     = 1'b0;
+
+    spatz_req.rm = fpu_rnd_mode_i;
+    spatz_req.fm = fpu_fmt_mode_i;
+	  
+	  spatz_req.op_vtl.use_vtl    = 1'b1;
+	  spatz_req.op_vtl.uscatter_vd = 1'b1;
+	  spatz_req.op_vtl.idx_vreg   = vs1_field;	// colummn indices used for gathereing accumulators from Ventaglio bank
+
+	  spatz_req.op_arith.vm = 1'b1;         // no masking
+	end	
+	
 	// MAC Operation for Unstructured Sparsity
 	riscv_instr::VFXUMACC_VRF: begin
 	  automatic vreg_t       vd_field  = decoder_req_i.instr[11:7];		// Accumulator
