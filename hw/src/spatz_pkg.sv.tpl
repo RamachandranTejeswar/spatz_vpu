@@ -586,7 +586,7 @@ package spatz_pkg;
   // VTGNrChannels represents the max asymmetric bandwidth ratio (1:4 -> 4,
   // 1:2 -> 2). Default 4 (= 1:4 support).
   localparam int unsigned VTGNrChannels         = VENTAGLIO_WFACTOR;
-  localparam int unsigned VTGNrBankChannels     = 16;   					// physical channels of 8 banks each (8 x 8 = 64 banks)
+  localparam int unsigned VTGNrBankChannels     = 4;   					// physical channels of 8 banks each (8 x 8 = 64 banks)
   localparam int unsigned VTGNrBanksPerChannel  = N_FU * 2;
   // localparam int unsigned VTGChannelWidth       = VTGNrBanksPerChannel * ELEN;
   // localparam int unsigned VTGChannelBWidth      = VTGNrBanksPerChannel * ELENB;

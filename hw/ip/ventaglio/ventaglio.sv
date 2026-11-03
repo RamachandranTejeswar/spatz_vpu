@@ -217,7 +217,7 @@ module ventaglio
     vl: spatz_req_i.vl
   };
 
-  // new_op -> if spatz_req is valid, (and) if the opration uses VTL (and) if the opertion is not to clear the buffer (and) if Ventaglio is ready, then accept the new operation
+  // new_op -> if spatz_req is valid, (and) if the operation uses VTL (and) if the operation is not to clear the buffer (and) if Ventaglio is ready, then accept the new operation
   logic new_op;
   assign new_op = spatz_req_valid_i && spatz_req_i.op_vtl.use_vtl && !spatz_req_i.op_vtl.clear_buffer && vtl_req_ready_o;
   
@@ -263,7 +263,7 @@ module ventaglio
 
    always_comb begin
       usp_scatter_running_d = usp_scatter_running_q;
-      if (usp_sjob_done)                                                   usp_scatter_running_d = 1'b0;
+      if (usp_sjob_done) usp_scatter_running_d = 1'b0;
       else if (spatz_req_valid && spatz_req.op_vtl.uscatter_vd && usp_sjob_valid) usp_scatter_running_d = 1'b1;
     end
       
@@ -276,7 +276,7 @@ module ventaglio
   /******************************/
 
   localparam int unsigned IdxBufDepth = 2;  // Depth of the spill register
-  localparam int unsigned IdxPerWord = 32;  // Indices per index word (16 indices in a 256-bit index word)
+  localparam int unsigned IdxPerWord = 32;  // Indices per index word (32 indices in a 256-bit index word)
 
   logic idx_req_valid;      // Indication of a valid index request to the idx_req register 
   logic idx_req_accepted;   // Request handed to the request register this cycle
@@ -290,8 +290,8 @@ module ventaglio
   logic [$clog2(NumIdxWords):0] word_cnt_d, word_cnt_q;
   logic [$clog2(NumIdxWords):0] num_words;
 
-  assign num_words            = idx_job_out.unstructured ? (idx_job_out.vl + IdxPerWord - 1) / IdxPerWord : 1;   // round up vl/16 to CEIL
-  assign last_word            = (word_cnt_q == num_words - 1);    // Chekc the word_cnt_q to see if this is the last index word
+  assign num_words            = idx_job_out.unstructured ? (idx_job_out.vl + IdxPerWord - 1) / IdxPerWord : 1;   // round up vl/32 to CEIL
+  assign last_word            = (word_cnt_q == num_words - 1);    // Check the word_cnt_q to see if this is the last index word
 
   // assign idx_buf_pop          = (spatz_req.op_vtl.gather_vs2 | spatz_req.op_vtl.uscatter_vd) ? load_index_o : (spatz_req_valid && spatz_req_ready && !spatz_req.op_vtl.clear_buffer);
 
@@ -469,8 +469,8 @@ module ventaglio
     is_gather  = spatz_req.op_vtl.gather_vd  && rgather_en_i;
     is_usp_gather = spatz_req.op_vtl.gather_vs2 && rgather_en_i;
     is_scatter = spatz_req.op_vtl.scatter_vd && wscatter_en_i;
-	// is_usp_scatter = spatz_req.op_vtl.uscatter_vd && wscatter_en_i;   // vsxu.vv write from the VFU
-  is_usp_scatter = usp_sjob_valid && wscatter_en_i;
+	  // is_usp_scatter = spatz_req.op_vtl.uscatter_vd && wscatter_en_i;   // vsxu.vv write from the VFU
+    is_usp_scatter = usp_sjob_valid && wscatter_en_i;
   end
 
   // write signals
@@ -503,7 +503,7 @@ module ventaglio
   logic           [VTGNrBankChannels-1:0][VTGNrBanksPerChannel-1:0] usp_we;     // For banks to be written to in the current cycle
   logic usp_scatter_active;
   // assign usp_scatter_active = spatz_req_valid && spatz_req.op_vtl.uscatter_vd;
-   assign usp_scatter_active = usp_sjob_valid;
+  assign usp_scatter_active = usp_sjob_valid;
 
   logic usp_scatter_wready;
   logic usp_scatter_load_index;
